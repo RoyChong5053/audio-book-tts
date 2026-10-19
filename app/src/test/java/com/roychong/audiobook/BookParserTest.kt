@@ -48,6 +48,22 @@ class BookParserTest {
     }
 
     @Test
+    fun parsesHtmlHeadings() {
+        val f = File.createTempFile("book", ".html")
+        f.writeText(
+            "<html><head><title>测试网页</title></head><body>" +
+                "<h1>第一章 开始</h1><p>第一段。</p><p>第二段。</p>" +
+                "<h2>第二章 结束</h2><p>最后一段。</p>" +
+                "</body></html>"
+        )
+        val parsed = BookParser.parse(f, "测试.html", "text/html")
+        f.delete()
+        assertEquals(2, parsed.chapters.size)
+        assertEquals("测试网页", parsed.title)
+        assertTrue(parsed.chapters[0].paragraphs.joinToString("").contains("第一段"))
+    }
+
+    @Test
     fun parsesMarkdownHeadings() {
         val f = File.createTempFile("book", ".md")
         f.writeText("# 第一章 起点\n\n这是**正文**。\n\n## 第二章 终点\n\n[链接](https://example.com) 结束。")
