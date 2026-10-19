@@ -456,7 +456,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
 
     override fun onState(state: ReadingController.PlayerState) {
         if (state.bookId != null && state.bookId != bookId) return
-        if (state.bookId == null && state.loading) return
+        if (state.loading) return
         if (state.chapterIndex != chapterIndex || state.chapterIndex != lastRenderedChapter) {
             renderChapter(state.chapterIndex, state.sentenceIndex, 0f)
             lastRenderedChapter = state.chapterIndex
