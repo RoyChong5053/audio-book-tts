@@ -165,9 +165,32 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         }
 
         applyColors()
+        loadBook()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        val id = intent.getStringExtra(EXTRA_BOOK_ID) ?: return
+        if (id == bookId) return
+        controller?.removeListener(this)
+        if (bound) {
+            runCatching { unbindService(conn) }
+            bound = false
+        }
+        controller = null
+        bookId = id
+        book = null
+        lastRenderedChapter = -1
+        setIntent(intent)
+        loadBook()
+    }
+
+    private fun loadBook() {
+        val loadingId = bookId
         io.execute {
-            val loaded = runCatching { store.load(bookId) }.getOrNull()
+            val loaded = runCatching { store.load(loadingId) }.getOrNull()
             main.post {
+                if (bookId != loadingId) return@post
                 if (loaded == null) {
                     toast("书籍不存在")
                     finish()
@@ -175,7 +198,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
                 }
                 book = loaded
                 bookTitle.text = loaded.title
-                val pos = store.progress(bookId)
+                val pos = store.progress(loadingId)
                 val c = pos.chapter.coerceIn(0, (loaded.chapters.size - 1).coerceAtLeast(0))
                 renderChapter(c, pos.sentence, if (pos.updatedAt > 0) pos.fraction else 0f)
                 connect()
@@ -325,6 +348,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         val b = book ?: return
         if (chapter != chapterIndex) {
             renderChapter(chapter, sentence, frac)
+            lastRenderedChapter = chapter
             return
         }
         val ch = b.chapters.getOrNull(chapter) ?: return
@@ -518,8 +542,8 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         val input = EditText(this).apply {
             hint = getString(R.string.reader_bookmark_note)
             setSingleLine(true)
-            setTextColor(theme.text)
-            setHintTextColor(theme.dim)
+            setTextColor(0xFFE7ECF2.toInt())
+            setHintTextColor(0xFF95A3B5.toInt())
         }
         val pad = (20 * resources.displayMetrics.density).toInt()
         val wrap = LinearLayout(this).apply {
@@ -604,7 +628,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         }
         val preview = TextView(this).apply {
             text = "字号预览 Aa 书"
-            setTextColor(theme.text)
+            setTextColor(0xFFE7ECF2.toInt())
             textSize = settings.fontSize().toFloat()
             setPadding(0, pad / 2, 0, 0)
         }

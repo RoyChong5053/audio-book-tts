@@ -83,6 +83,9 @@ app/src/main/java/com/roychong/audiobook/
 ```bash
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
+
+# 解析器 / 切句单测
+./gradlew testDebugUnitTest
 ```
 
 环境：JDK 17、Android SDK 35、minSdk 24。
