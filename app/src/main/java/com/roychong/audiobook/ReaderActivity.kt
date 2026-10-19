@@ -55,6 +55,8 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
     private lateinit var nextButton: TextView
     private lateinit var progressText: TextView
     private lateinit var statusText: TextView
+    private lateinit var overlayPreload: View
+    private lateinit var tvPreload: TextView
     private lateinit var btnBack: TextView
     private lateinit var btnToc: TextView
     private lateinit var btnBookmark: TextView
@@ -78,6 +80,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
     private var weightCum: FloatArray = FloatArray(0)
     private var lastHighlight = 0
     private var lastSentence = -1
+    private var lastBgSentence = -1
     private var lastError: String? = null
 
     private var suppressAutoScrollUntil = 0L
@@ -143,6 +146,8 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         nextButton = findViewById(R.id.btnNext)
         progressText = findViewById(R.id.tvProgress)
         statusText = findViewById(R.id.tvStatus)
+        overlayPreload = findViewById(R.id.overlayPreload)
+        tvPreload = findViewById(R.id.tvPreload)
         btnBack = findViewById(R.id.btnBack)
         btnToc = findViewById(R.id.btnToc)
         btnBookmark = findViewById(R.id.btnBookmark)
@@ -155,6 +160,9 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         btnToc.setOnClickListener { showToc() }
         btnBookmark.setOnClickListener { showBookmarks() }
         btnMore.setOnClickListener { showMore() }
+        findViewById<TextView>(R.id.btnCancelPreload).setOnClickListener {
+            controller?.pause()
+        }
 
         scroll.setOnTouchListener { _, ev ->
             if (ev.action == MotionEvent.ACTION_DOWN || ev.action == MotionEvent.ACTION_MOVE) {
@@ -261,6 +269,8 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         progressText.setTextColor(theme.dim)
         statusText.setTextColor(theme.dim)
         content.setTextColor(theme.dim)
+        overlayPreload.setBackgroundColor(ThemeUi.withAlpha(theme.bg, 0xF0))
+        tvPreload.setTextColor(theme.text)
         topBar.setBackgroundColor(ThemeUi.withAlpha(theme.bg, 0xF2))
         bottomBar.setBackgroundColor(ThemeUi.withAlpha(theme.bg, 0xF2))
         applyFont()
@@ -285,6 +295,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         weightCum = buildWeights(ch.text)
         lastHighlight = 0
         lastSentence = -1
+        lastBgSentence = -1
         hotSpan = null
         bgSpan = null
         val sp = SpannableString(ch.text)
@@ -312,6 +323,10 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         content.setText(sp, TextView.BufferType.SPANNABLE)
         spannable = content.text as? Spannable ?: sp
         lastHighlight = 0
+        lastSentence = -1
+        lastBgSentence = -1
+        hotSpan = null
+        bgSpan = null
         drawAtSentence(keepSentence, keepIdx, forceScroll = false)
         scroll.post { scrollToOffset(keepIdx, force = false) }
     }
@@ -333,12 +348,15 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
                 sp.setSpan(it, 0, idx, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         } else null
-        if (bgSpan != null) sp.removeSpan(bgSpan)
-        val s = ch.sentences.getOrNull(sentence)
-        if (s != null && s.start < s.end && s.end <= sp.length) {
-            bgSpan = BackgroundColorSpan(theme.sentenceBg).also {
-                sp.setSpan(it, s.start, s.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
+        if (sentence != lastBgSentence || bgSpan == null) {
+            if (bgSpan != null) sp.removeSpan(bgSpan)
+            val s = ch.sentences.getOrNull(sentence)
+            bgSpan = if (s != null && s.start < s.end && s.end <= sp.length) {
+                BackgroundColorSpan(theme.sentenceBg).also {
+                    sp.setSpan(it, s.start, s.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+                }
+            } else null
+            lastBgSentence = sentence
         }
         content.invalidate()
         if (forceScroll) scrollToOffset(idx, force = true)
@@ -380,13 +398,6 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
                 sp.setSpan(it, 0, i, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         } else null
-        if (bgSpan != null) sp.removeSpan(bgSpan)
-        val s = ch.sentences.getOrNull(sentence)
-        if (s != null && s.start < s.end && s.end <= sp.length) {
-            bgSpan = BackgroundColorSpan(theme.sentenceBg).also {
-                sp.setSpan(it, s.start, s.end, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-            }
-        }
         content.invalidate()
     }
 
@@ -463,14 +474,23 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         }
         bookTitle.text = state.bookTitle.ifBlank { book?.title.orEmpty() }
         chapterTitle.text = state.chapterTitle
-        playButton.text = if (state.playing || state.preparing) "❚❚" else "▶"
+        playButton.text = if (state.playing || state.preloading) "❚❚" else "▶"
         progressText.text = "${state.chapterIndex + 1}/${state.chapterCount} · ${state.sentenceIndex + 1}/${state.sentenceCount}"
         if (state.error != null && state.error != lastError) {
             lastError = state.error
             toast(getString(R.string.reader_error_fmt, state.error))
         }
+        if (state.preloading) {
+            overlayPreload.visibility = View.VISIBLE
+            val buf = formatMs(state.preloadBufferedMs)
+            val target = formatMs(max(1L, state.preloadTargetMs))
+            tvPreload.text = getString(R.string.preload_status_fmt, buf, target)
+        } else {
+            overlayPreload.visibility = View.GONE
+        }
         statusText.text = when {
             state.error != null -> getString(R.string.reader_error_fmt, state.error)
+            state.buffering -> "缓冲中，正在合成后面的内容…"
             state.preparing -> "合成中…"
             state.sleepAt > 0 -> {
                 val min = ((state.sleepAt - System.currentTimeMillis()) / 60000L).coerceAtLeast(0) + 1
@@ -481,7 +501,7 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         statusText.visibility =
             if (barsVisible && statusText.text.isNotEmpty()) View.VISIBLE else View.GONE
         statusText.setTextColor(if (state.error != null) theme.hot else theme.dim)
-        root.keepScreenOn = state.playing || state.preparing
+        root.keepScreenOn = state.playing || state.preloading || state.buffering
     }
 
     override fun onHighlight(chapter: Int, sentence: Int, fraction: Float) {
@@ -690,6 +710,11 @@ class ReaderActivity : AppCompatActivity(), ReadingController.Listener {
         val s = ch.sentenceAt(offset)
         controller?.playFrom(chapterIndex, s) ?: toast(getString(R.string.reader_loading))
         suppressAutoScrollUntil = 0
+    }
+
+    private fun formatMs(ms: Long): String {
+        val total = (ms / 1000L).coerceAtLeast(0)
+        return "%d:%02d".format(total / 60, total % 60)
     }
 
     private fun toast(msg: String) {

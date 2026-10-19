@@ -34,79 +34,177 @@
             style="@style/SectionTitle"
             android:text="@string/sec_tts" />
 
+        <!-- ============ API profile ============ -->
+        <TextView
+            android:id="@+id/tvProfileTitle"
+            style="@style/FieldLabel"
+            android:text="@string/profile_title" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <Spinner
+                android:id="@+id/spProfile"
+                style="@style/FieldInput"
+                android:layout_width="0dp"
+                android:layout_weight="1" />
+
+            <Button
+                android:id="@+id/btnRenameProfile"
+                style="@style/ProfileSideButton"
+                android:text="@string/profile_rename" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="10dp"
+            android:orientation="horizontal">
+
+            <Button
+                android:id="@+id/btnAddProfile"
+                style="@style/ProfAction"
+                android:text="@string/profile_add" />
+
+            <Button
+                android:id="@+id/btnDupProfile"
+                style="@style/ProfAction"
+                android:text="@string/profile_dup" />
+
+            <Button
+                android:id="@+id/btnDelProfile"
+                style="@style/ProfAction"
+                android:text="@string/profile_del" />
+        </LinearLayout>
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="10dp"
+            android:text="@string/profile_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/tts_base" />
+
         <EditText
             android:id="@+id/etBase"
             style="@style/FieldInput"
-            android:hint="@string/tts_base"
+            android:hint="@string/tts_base_hint"
             android:inputType="textUri" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/tts_key" />
 
         <EditText
             android:id="@+id/etKey"
             style="@style/FieldInput"
-            android:hint="@string/tts_key"
+            android:hint="@string/tts_key_hint"
             android:inputType="textPassword" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/tts_model" />
 
         <EditText
             android:id="@+id/etModel"
             style="@style/FieldInput"
-            android:hint="@string/tts_model"
+            android:hint="@string/tts_model_hint"
             android:inputType="text" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/tts_voice" />
 
         <EditText
             android:id="@+id/etVoice"
             style="@style/FieldInput"
-            android:hint="@string/tts_voice"
+            android:hint="@string/tts_voice_hint"
             android:inputType="text" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/tts_speed" />
 
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/tts_speed" />
-
-            <EditText
-                android:id="@+id/etSpeed"
-                style="@style/FieldInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="numberDecimal" />
-        </LinearLayout>
+        <EditText
+            android:id="@+id/etSpeed"
+            style="@style/FieldInput"
+            android:inputType="numberDecimal" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="-4dp"
+            android:layout_marginBottom="12dp"
             android:text="@string/tts_speed_hint"
             android:textColor="@color/text_secondary"
             android:textSize="11sp" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/tts_timeout" />
 
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/tts_timeout" />
-
-            <EditText
-                android:id="@+id/etTimeout"
-                style="@style/FieldInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="number" />
-        </LinearLayout>
+        <EditText
+            android:id="@+id/etTimeout"
+            style="@style/FieldInput"
+            android:inputType="number" />
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:layout_marginTop="-4dp"
+            android:layout_marginBottom="12dp"
             android:text="@string/tts_timeout_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_chunk" />
+
+        <Spinner
+            android:id="@+id/spChunk"
+            style="@style/FieldInput" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_chunk_custom" />
+
+        <EditText
+            android:id="@+id/etChunkChars"
+            style="@style/FieldInput"
+            android:inputType="number" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="-4dp"
+            android:layout_marginBottom="12dp"
+            android:text="@string/chunk_custom_hint"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp" />
+
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_preload" />
+
+        <EditText
+            android:id="@+id/etPreloadMin"
+            style="@style/FieldInput"
+            android:inputType="number" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="-4dp"
+            android:layout_marginBottom="12dp"
+            android:text="@string/preload_hint"
             android:textColor="@color/text_secondary"
             android:textSize="11sp" />
 
@@ -115,7 +213,7 @@
             style="@style/BarButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="6dp"
+            android:layout_marginTop="4dp"
             android:text="@string/tts_test" />
 
         <Button
@@ -144,6 +242,14 @@
             android:textColor="@color/text_secondary"
             android:textSize="12sp" />
 
+        <TextView
+            android:id="@+id/tvCachePath"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="3dp"
+            android:textColor="@color/text_dim"
+            android:textSize="10sp" />
+
         <Button
             android:id="@+id/btnClearCache"
             style="@style/BarButton"
@@ -156,105 +262,56 @@
             style="@style/SectionTitle"
             android:text="@string/sec_reading" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_theme" />
 
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/setting_theme" />
+        <Spinner
+            android:id="@+id/spTheme"
+            style="@style/FieldInput" />
 
-            <Spinner
-                android:id="@+id/spTheme"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:background="@color/field_bg" />
-        </LinearLayout>
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_font_size" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+        <EditText
+            android:id="@+id/etFontSize"
+            style="@style/FieldInput"
+            android:inputType="number" />
 
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/setting_font_size" />
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_line_spacing" />
 
-            <EditText
-                android:id="@+id/etFontSize"
-                style="@style/FieldInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="number" />
-        </LinearLayout>
+        <EditText
+            android:id="@+id/etLineSpacing"
+            style="@style/FieldInput"
+            android:inputType="numberDecimal" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_margin" />
 
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/setting_line_spacing" />
+        <EditText
+            android:id="@+id/etMargin"
+            style="@style/FieldInput"
+            android:inputType="number" />
 
-            <EditText
-                android:id="@+id/etLineSpacing"
-                style="@style/FieldInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="numberDecimal" />
-        </LinearLayout>
+        <TextView
+            style="@style/FieldLabel"
+            android:text="@string/setting_font_family" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/setting_margin" />
-
-            <EditText
-                android:id="@+id/etMargin"
-                style="@style/FieldInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="number" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/setting_font_family" />
-
-            <Spinner
-                android:id="@+id/spFont"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:background="@color/field_bg" />
-        </LinearLayout>
+        <Spinner
+            android:id="@+id/spFont"
+            style="@style/FieldInput" />
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:gravity="center_vertical"
             android:orientation="horizontal"
-            android:paddingTop="8dp">
+            android:paddingTop="4dp"
+            android:paddingBottom="4dp">
 
             <TextView
                 android:layout_width="0dp"
@@ -262,31 +319,12 @@
                 android:layout_weight="1"
                 android:text="@string/setting_auto_scroll"
                 android:textColor="@color/text_secondary"
-                android:textSize="13sp" />
+                android:textSize="14sp" />
 
             <Switch
                 android:id="@+id/swAutoScroll"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content" />
-        </LinearLayout>
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:gravity="center_vertical"
-            android:orientation="horizontal">
-
-            <TextView
-                style="@style/RowLabel"
-                android:text="@string/setting_cache_mb" />
-
-            <EditText
-                android:id="@+id/etCacheMb"
-                style="@style/FieldInput"
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:inputType="number" />
         </LinearLayout>
 
         <Button

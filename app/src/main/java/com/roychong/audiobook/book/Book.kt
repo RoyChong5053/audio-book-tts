@@ -142,6 +142,8 @@ data class Position(
     val fraction: Float = 0f,
     val updatedAt: Long = 0L,
     val percent: Int = 0,
+    /** 章节内字符偏移；-1 表示旧版本没有记录。 */
+    val charOffset: Int = -1,
 )
 
 data class Bookmark(

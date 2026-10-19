@@ -2,7 +2,10 @@ package com.roychong.audiobook
 
 import android.Manifest
 import android.app.AlertDialog
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -10,6 +13,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.view.View
 import android.view.ViewGroup
@@ -24,11 +28,13 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.roychong.audiobook.book.BookInfo
 import com.roychong.audiobook.book.BookStore
+import com.roychong.audiobook.player.PlaybackService
+import com.roychong.audiobook.player.ReadingController
 import com.roychong.audiobook.ui.ThemeUi
 import java.io.File
 import java.util.concurrent.Executors
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), ReadingController.Listener {
 
     private lateinit var store: BookStore
     private lateinit var settings: AppSettings
@@ -36,9 +42,31 @@ class MainActivity : AppCompatActivity() {
     private lateinit var empty: TextView
     private lateinit var progress: ProgressBar
     private lateinit var adapter: BookAdapter
+    private lateinit var miniPlayer: View
+    private lateinit var tvMiniTitle: TextView
+    private lateinit var tvMiniChapter: TextView
+    private lateinit var btnMiniPlay: TextView
+    private var controller: ReadingController? = null
+    private var bound = false
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
     private var importing = false
+
+    private val conn = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val b = binder as? PlaybackService.LocalBinder ?: return
+            val c = b.controller()
+            controller = c
+            bound = true
+            c.addListener(this@MainActivity)
+            onState(c.state())
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            controller = null
+            bound = false
+        }
+    }
 
     private val openDoc = registerForActivityResult(
         androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
@@ -55,6 +83,10 @@ class MainActivity : AppCompatActivity() {
         list = findViewById(R.id.listBooks)
         empty = findViewById(R.id.tvEmpty)
         progress = findViewById(R.id.progressImport)
+        miniPlayer = findViewById(R.id.miniPlayer)
+        tvMiniTitle = findViewById(R.id.tvMiniTitle)
+        tvMiniChapter = findViewById(R.id.tvMiniChapter)
+        btnMiniPlay = findViewById(R.id.btnMiniPlay)
         adapter = BookAdapter()
         list.adapter = adapter
         list.emptyView = empty
@@ -85,12 +117,46 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnSettings).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
+        btnMiniPlay.setOnClickListener { controller?.toggle() }
+        findViewById<View>(R.id.btnMiniPrev).setOnClickListener { controller?.prevSentence() }
+        findViewById<View>(R.id.btnMiniNext).setOnClickListener { controller?.nextSentence() }
+        findViewById<View>(R.id.btnMiniStop).setOnClickListener { controller?.stop() }
+        miniPlayer.setOnClickListener {
+            val id = controller?.state()?.bookId ?: return@setOnClickListener
+            openReader(id)
+        }
+        findViewById<View>(R.id.miniInfo).setOnClickListener {
+            val id = controller?.state()?.bookId ?: return@setOnClickListener
+            openReader(id)
+        }
 
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 9)
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (!bound) {
+            runCatching {
+                bindService(
+                    Intent(this, PlaybackService::class.java),
+                    conn,
+                    Context.BIND_AUTO_CREATE,
+                )
+            }
+        }
+    }
+
+    override fun onStop() {
+        controller?.removeListener(this)
+        if (bound) {
+            runCatching { unbindService(conn) }
+            bound = false
+        }
+        super.onStop()
     }
 
     override fun onResume() {
@@ -111,6 +177,13 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnImport).backgroundTintList =
             android.content.res.ColorStateList.valueOf(t.accent)
         findViewById<Button>(R.id.btnImport).setTextColor(t.bg)
+        miniPlayer.setBackgroundColor(t.panel)
+        tvMiniTitle.setTextColor(t.text)
+        tvMiniChapter.setTextColor(t.dim)
+        btnMiniPlay.setTextColor(t.accent)
+        findViewById<TextView>(R.id.btnMiniPrev).setTextColor(t.dim)
+        findViewById<TextView>(R.id.btnMiniNext).setTextColor(t.dim)
+        findViewById<TextView>(R.id.btnMiniStop).setTextColor(t.dim)
     }
 
     private fun refresh() {
@@ -184,6 +257,24 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton(getString(R.string.cancel), null)
             .show()
     }
+
+    override fun onState(state: ReadingController.PlayerState) {
+        val show = state.bookId != null && !state.loading
+        miniPlayer.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        tvMiniTitle.text = state.bookTitle.ifBlank { getString(R.string.app_name) }
+        val suffix = when {
+            state.error != null -> " · 出错"
+            state.preloading -> " · 预加载中"
+            state.buffering -> " · 缓冲中"
+            state.preparing -> " · 合成中"
+            else -> ""
+        }
+        tvMiniChapter.text = state.chapterTitle + suffix
+        btnMiniPlay.text = if (state.playing || state.preloading) "❚❚" else "▶"
+    }
+
+    override fun onHighlight(chapter: Int, sentence: Int, fraction: Float) {}
 
     private inner class BookAdapter : BaseAdapter() {
         var items: List<BookInfo> = emptyList()

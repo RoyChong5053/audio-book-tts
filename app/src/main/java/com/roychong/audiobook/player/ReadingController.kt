@@ -8,25 +8,29 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import com.roychong.audiobook.AppSettings
-import com.roychong.audiobook.TtsConfig
 import com.roychong.audiobook.book.Book
 import com.roychong.audiobook.book.BookStore
 import com.roychong.audiobook.book.Position
-import com.roychong.audiobook.tts.TtsCache
+import com.roychong.audiobook.book.SpeechChunk
+import com.roychong.audiobook.book.SpeechChunker
+import com.roychong.audiobook.tts.AudioMeta
+import com.roychong.audiobook.tts.BookAudioStore
 import com.roychong.audiobook.tts.TtsClient
 import java.util.concurrent.CopyOnWriteArrayList
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
- * 朗读控制器：把「书名/章节/句子」变成 TTS 请求，再交给 AudioPlayer 的连续通道播放。
+ * 朗读控制器：分块合成、磁盘预取、连续播放、KTV 进度和归档。
  *
- * 线程模型：
- *  - 对外方法（play/pause/seek…）都在主线程调用；
- *  - 合成跑在单独的 producer 线程里，只通过 [post] 回主线程更新状态；
- *  - AudioPlayer 的播放进度来自 AudioTrack 的实际播放位置，所以 KTV 高亮跟耳朵一致。
+ * 关键变化（v0.2）：
+ *  - 不再一句一请求，而是按用户选择的块长（120 / 300 / 2000 字…）请求 TTS；
+ *  - 首块永远压到 80 字以内，先快速开口；
+ *  - 合成线程只看“预取目标”往前跑，播放在后面消费，云端不会无限调用；
+ *  - 每块音频落盘缓存，并 append 到“本模型 + 本次播放”的归档文件；
+ *  - 大块也能从块中间恢复：保存字符偏移，恢复时按权重 seek 到对应音频位置。
  */
 class ReadingController(context: Context) {
 
@@ -41,6 +45,13 @@ class ReadingController(context: Context) {
         val playing: Boolean = false,
         val preparing: Boolean = false,
         val speaking: Boolean = false,
+        val preloading: Boolean = false,
+        val buffering: Boolean = false,
+        val preloadBufferedMs: Long = 0L,
+        val preloadTargetMs: Long = 0L,
+        val bufferedAheadMs: Long = 0L,
+        val chunkIndex: Int = 0,
+        val chunkCount: Int = 0,
         val error: String? = null,
         val sleepAt: Long = 0L,
         val loading: Boolean = false,
@@ -58,24 +69,26 @@ class ReadingController(context: Context) {
     private val store = BookStore(app)
     private val settings = AppSettings(app)
     private val player = AudioPlayer(app)
+    private val audio = BookAudioStore(app)
     private val loader = Executors.newSingleThreadExecutor()
 
-    private var cache = TtsCache(app, settings.cacheCapMb())
-
     @Volatile private var book: Book? = null
+    @Volatile private var chunks: List<SpeechChunk> = emptyList()
+    private var chunkCharsBuilt = -1
+    private val weightCache = HashMap<Int, FloatArray>()
+
     @Volatile private var chapterIndex = 0
     @Volatile private var sentenceIndex = 0
-    @Volatile private var fraction = 0f
+    @Volatile private var sentenceFraction = 0f
+    @Volatile private var currentChunkIndex = 0
+    @Volatile private var currentChunkFraction = 0f
+
     @Volatile private var session = 0
     @Volatile private var paused = true
-    @Volatile private var currentCanceller: TtsClient.Canceller? = null
-    @Volatile private var speaker: AudioPlayer.Speaker? = null
-    @Volatile private var mode = 0              // 0 未知 / 1 PCM / 2 压缩
-    @Volatile private var speakerRate = 24000
-    @Volatile private var lastSaved = 0L
     @Volatile private var openToken = 0
+    @Volatile private var lastSaved = 0L
     @Volatile private var state = PlayerState()
-
+    private var currentSession: Session? = null
     private var sleepRunnable: Runnable? = null
 
     private val audioManager = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -110,8 +123,7 @@ class ReadingController(context: Context) {
 
     fun currentSentenceText(): String {
         val b = book ?: return ""
-        return b.chapters.getOrNull(chapterIndex)
-            ?.sentences?.getOrNull(sentenceIndex)?.text.orEmpty()
+        return b.chapters.getOrNull(chapterIndex)?.sentences?.getOrNull(sentenceIndex)?.text.orEmpty()
     }
 
     fun currentChapter(): com.roychong.audiobook.book.Chapter? =
@@ -120,25 +132,20 @@ class ReadingController(context: Context) {
     fun openBook(bookId: String, chapter: Int = -1, sentence: Int = -1, autoPlay: Boolean = false) {
         val b = book
         if (b != null && b.id == bookId) {
-            // 已经在读这本：只同步位置，不打断正在播放的音频
             if (chapter >= 0) {
                 val c = chapter.coerceIn(0, (b.chapters.size - 1).coerceAtLeast(0))
                 val s = sentence.coerceIn(0, (b.chapters.getOrNull(c)?.sentences?.size?.minus(1) ?: 0).coerceAtLeast(0))
                 if (state.playing && (c != chapterIndex || s != sentenceIndex)) {
-                    seekTo(c, s, play = true)
+                    moveTo(c, s, play = true)
                 } else if (!state.playing) {
-                    chapterIndex = c
-                    sentenceIndex = s
-                    fraction = 0f
-                    publishState(playing = false, preparing = false, speaking = false, error = null)
-                    notifyHighlight()
+                    moveTo(c, s, play = false)
                 }
             }
             if (autoPlay) play()
             return
         }
         val token = ++openToken
-        stopInternal(clearBook = true)
+        stopPlayback(clearBook = true)
         state = PlayerState(loading = true, bookId = bookId)
         publish()
         loader.execute {
@@ -152,25 +159,33 @@ class ReadingController(context: Context) {
                     return@post
                 }
                 book = loaded
+                rebuildChunks(loaded)
                 val c = (if (chapter >= 0) chapter else pos.chapter)
                     .coerceIn(0, (loaded.chapters.size - 1).coerceAtLeast(0))
                 val maxS = (loaded.chapters.getOrNull(c)?.sentences?.size?.minus(1) ?: 0).coerceAtLeast(0)
                 val s = (if (sentence >= 0) sentence else pos.sentence).coerceIn(0, maxS)
                 chapterIndex = c
                 sentenceIndex = s
-                fraction = if (chapter < 0 && sentence < 0) pos.fraction else 0f
+                sentenceFraction = if (chapter < 0 && sentence < 0) pos.fraction else 0f
+                val start = resolveStart(loaded, c, s, pos)
+                currentChunkIndex = start.first
+                currentChunkFraction = start.second
                 settings.saveLastBookId(bookId)
                 state = PlayerState(
-                    bookId = loaded.id, bookTitle = loaded.title,
-                    chapterIndex = c, chapterTitle = loaded.chapters[c].title,
+                    bookId = loaded.id,
+                    bookTitle = loaded.title,
+                    chapterIndex = c,
+                    chapterTitle = loaded.chapters[c].title,
                     chapterCount = loaded.chapters.size,
-                    sentenceIndex = s, sentenceCount = loaded.chapters[c].sentences.size,
-                    playing = false, preparing = false, speaking = false,
+                    sentenceIndex = s,
+                    sentenceCount = loaded.chapters[c].sentences.size,
+                    chunkIndex = currentChunkIndex,
+                    chunkCount = chunks.size,
                     sleepAt = state.sleepAt,
                 )
                 publish()
                 notifyHighlight()
-                if (autoPlay) startPlayback()
+                if (autoPlay) startSession(currentChunkIndex, currentChunkFraction)
             }
         }
     }
@@ -180,49 +195,56 @@ class ReadingController(context: Context) {
             settings.lastBookId()?.let { openBook(it, autoPlay = true) }
             return
         }
-        if (state.playing || state.preparing) return
-        startPlayback()
+        if (state.playing || state.preloading) return
+        ensureChunksFresh()
+        startSession(currentChunkIndex, currentChunkFraction)
     }
 
     fun pause() {
-        if (!state.playing && !state.preparing) return
+        if (!state.playing && !state.preloading) return
         paused = true
         ++session
-        currentCanceller?.cancel()
-        currentCanceller = null
-        speaker?.cancel()
-        speaker = null
-        player.stop()
-        mode = 0
+        cancelCurrentSession()
         saveProgress(force = true)
         abandonFocus()
-        publishState(playing = false, preparing = false, speaking = false)
+        state = state.copy(
+            playing = false, preparing = false, speaking = false,
+            preloading = false, buffering = false,
+        )
+        publish()
         notifyHighlight()
         onActiveChanged?.invoke(false)
     }
 
     fun toggle() {
-        if (state.playing || state.preparing) pause() else play()
+        if (state.playing || state.preloading) pause() else play()
     }
 
     fun stop() {
-        stopInternal(clearBook = false)
-        publishState(playing = false, preparing = false, speaking = false)
+        paused = true
+        ++session
+        cancelCurrentSession()
+        saveProgress(force = true)
         abandonFocus()
+        state = state.copy(
+            playing = false, preparing = false, speaking = false,
+            preloading = false, buffering = false,
+        )
+        publish()
         onActiveChanged?.invoke(false)
     }
 
     fun nextSentence() {
         val b = book ?: return
-        val ch = b.chapters.getOrNull(chapterIndex) ?: return
         var c = chapterIndex
         var s = sentenceIndex + 1
+        val ch = b.chapters.getOrNull(c) ?: return
         if (s >= ch.sentences.size) {
-            c += 1
+            c++
             s = 0
         }
         if (c >= b.chapters.size) return
-        moveTo(c, s, play = state.playing || state.preparing)
+        moveTo(c, s, play = state.playing || state.preloading)
     }
 
     fun prevSentence() {
@@ -230,29 +252,28 @@ class ReadingController(context: Context) {
         var c = chapterIndex
         var s = sentenceIndex - 1
         if (s < 0) {
-            c -= 1
+            c--
             if (c < 0) return
             s = (b.chapters[c].sentences.size - 1).coerceAtLeast(0)
         }
-        moveTo(c, s, play = state.playing || state.preparing)
+        moveTo(c, s, play = state.playing || state.preloading)
     }
 
     fun nextChapter() {
         val b = book ?: return
         if (chapterIndex + 1 >= b.chapters.size) return
-        moveTo(chapterIndex + 1, 0, play = state.playing || state.preparing)
+        moveTo(chapterIndex + 1, 0, play = state.playing || state.preloading)
     }
 
     fun prevChapter() {
         book ?: return
         if (chapterIndex <= 0) return
-        moveTo(chapterIndex - 1, 0, play = state.playing || state.preparing)
+        moveTo(chapterIndex - 1, 0, play = state.playing || state.preloading)
     }
 
-    /** 从目录跳章；正在播就继续播。 */
-    fun goToChapter(chapter: Int) = moveTo(chapter, 0, play = state.playing || state.preparing)
+    fun goToChapter(chapter: Int) =
+        moveTo(chapter, 0, play = state.playing || state.preloading)
 
-    /** 从某一句开始朗读（长按文字）。 */
     fun playFrom(chapter: Int, sentence: Int) = moveTo(chapter, sentence, play = true)
 
     fun seekTo(chapter: Int, sentence: Int, play: Boolean) = moveTo(chapter, sentence, play)
@@ -280,282 +301,542 @@ class ReadingController(context: Context) {
 
     fun sleepAt(): Long = state.sleepAt
 
-    /** 缓存对象的容量可能被设置页改过。 */
-    fun refreshCache() {
-        cache = TtsCache(app, settings.cacheCapMb())
-    }
+    fun cacheBytes(): Long = audio.totalBytes()
 
-    fun cacheBytes(): Long = cache.totalBytes()
+    fun clearCache() = audio.clearAll()
 
-    fun clearCache() = cache.clear()
+    fun cachePath(): String = audio.root.absolutePath
 
     fun release() {
-        stopInternal(clearBook = true)
+        paused = true
+        ++session
+        cancelCurrentSession()
         abandonFocus()
         loader.shutdownNow()
         sleepRunnable?.let { main.removeCallbacks(it) }
     }
 
-    // 由 Service 注入：播放/暂停时申请释放前台状态
     var onActiveChanged: ((Boolean) -> Unit)? = null
 
-    // ---------------- 内部：位置变化 ----------------
+    // ---------------- 位置/会话 ----------------
+
+    private fun rebuildChunks(book: Book) {
+        val size = settings.chunkChars()
+        chunks = SpeechChunker.build(book, size)
+        chunkCharsBuilt = size
+        weightCache.clear()
+    }
+
+    /** 设置页改过块长后，下一次播放/跳转时重新切块并把当前位置映射回去。 */
+    private fun ensureChunksFresh() {
+        val b = book ?: return
+        val size = settings.chunkChars()
+        if (size == chunkCharsBuilt && chunks.isNotEmpty()) return
+        val oldChar = currentCharOffset()
+        rebuildChunks(b)
+        val ci = chunks.indexOfFirst {
+            it.chapterIndex == chapterIndex && oldChar >= it.startChar && oldChar < it.endChar
+        }.let { if (it >= 0) it else chunks.indexOfFirst { it.chapterIndex == chapterIndex } }
+        if (ci >= 0) {
+            currentChunkIndex = ci
+            currentChunkFraction = fractionForChar(b, chunks[ci], oldChar)
+        }
+    }
+
+    private fun currentCharOffset(): Int {
+        val b = book ?: return 0
+        val chunk = chunks.getOrNull(currentChunkIndex)
+        if (chunk != null) return charForChunkFraction(chunk, currentChunkFraction)
+        return b.chapters.getOrNull(chapterIndex)?.sentences?.getOrNull(sentenceIndex)?.start ?: 0
+    }
+
+    /** 从旧进度/字符偏移定位到 chunk 与块内比例。 */
+    private fun resolveStart(book: Book, chapter: Int, sentence: Int, pos: Position): Pair<Int, Float> {
+        if (chunks.isEmpty()) return 0 to 0f
+        val ch = book.chapters.getOrNull(chapter)
+        val targetChar = when {
+            pos.charOffset >= 0 -> pos.charOffset.coerceIn(0, ch?.text?.length ?: 0)
+            ch != null -> ch.sentences.getOrNull(sentence)?.start ?: 0
+            else -> 0
+        }
+        val ci = chunks.indexOfFirst {
+            it.chapterIndex == chapter && targetChar >= it.startChar && targetChar < it.endChar
+        }.let { if (it >= 0) it else chunks.indexOfFirst { it.chapterIndex == chapter } }
+        if (ci < 0) return 0 to 0f
+        val chunk = chunks[ci]
+        val frac = fractionForChar(book, chunk, targetChar)
+        return ci to frac.coerceIn(0f, 0.999f)
+    }
+
+    private fun chunkForSentence(chapter: Int, sentence: Int): SpeechChunk? =
+        chunks.firstOrNull {
+            it.chapterIndex == chapter && sentence >= it.startSentence && sentence <= it.endSentence
+        }
+
+    private fun fractionForSentence(book: Book, chunk: SpeechChunk, sentence: Int): Float {
+        val ch = book.chapters.getOrNull(chunk.chapterIndex) ?: return 0f
+        val s = ch.sentences.getOrNull(sentence) ?: return 0f
+        return fractionForChar(book, chunk, s.start)
+    }
+
+    private fun charForChunkFraction(chunk: SpeechChunk, fraction: Float): Int {
+        val w = weightsFor(chunk.chapterIndex)
+        val lo = w.getOrElse(chunk.startChar) { 0f }
+        val hi = w.getOrElse(chunk.endChar) { lo }
+        return weightIndex(w, lo + (hi - lo) * fraction.coerceIn(0f, 1f))
+    }
+
+    private fun fractionForChar(book: Book, chunk: SpeechChunk, char: Int): Float {
+        val ch = book.chapters.getOrNull(chunk.chapterIndex) ?: return 0f
+        val w = weightsFor(chunk.chapterIndex)
+        val lo = w.getOrElse(chunk.startChar) { 0f }
+        val hi = w.getOrElse(chunk.endChar) { lo }
+        if (hi <= lo) return 0f
+        val target = w.getOrElse(char.coerceIn(chunk.startChar, chunk.endChar)) { lo }
+        return ((target - lo) / (hi - lo)).coerceIn(0f, 1f)
+    }
 
     private fun moveTo(chapter: Int, sentence: Int, play: Boolean) {
         val b = book ?: return
+        ensureChunksFresh()
         val c = chapter.coerceIn(0, (b.chapters.size - 1).coerceAtLeast(0))
         val ch = b.chapters.getOrNull(c) ?: return
         val s = sentence.coerceIn(0, (ch.sentences.size - 1).coerceAtLeast(0))
-        stopPlaybackOnly()
+        paused = true
+        ++session
+        cancelCurrentSession()
+        saveProgress(force = true)
         chapterIndex = c
         sentenceIndex = s
-        fraction = 0f
+        sentenceFraction = 0f
+        val chunk = chunkForSentence(c, s)
+        currentChunkIndex = chunk?.let { chunks.indexOf(it) } ?: 0
+        currentChunkFraction = chunk?.let { fractionForSentence(b, it, s) } ?: 0f
         state = state.copy(
-            chapterIndex = c, chapterTitle = ch.title,
-            sentenceIndex = s, sentenceCount = ch.sentences.size,
-            playing = false, preparing = false, speaking = false, error = null,
+            chapterIndex = c,
+            chapterTitle = ch.title,
+            sentenceIndex = s,
+            sentenceCount = ch.sentences.size,
+            playing = false,
+            preparing = false,
+            speaking = false,
+            preloading = false,
+            buffering = false,
+            chunkIndex = currentChunkIndex,
+            chunkCount = chunks.size,
+            error = null,
         )
         publish()
         notifyHighlight()
         saveProgress(force = true)
-        if (play) startPlayback() else onActiveChanged?.invoke(false)
+        if (play) startSession(currentChunkIndex, currentChunkFraction)
+        else onActiveChanged?.invoke(false)
     }
 
-    private fun startPlayback() {
+    private fun startSession(startChunk: Int, startFraction: Float) {
         val b = book ?: return
-        val ch = b.chapters.getOrNull(chapterIndex) ?: return
-        if (ch.sentences.isEmpty()) {
-            if (chapterIndex + 1 < b.chapters.size) moveTo(chapterIndex + 1, 0, play = true)
+        if (chunks.isEmpty() || startChunk >= chunks.size) {
+            finishBook()
             return
         }
         if (!requestFocus()) {
-            publishState(playing = false, error = "无法获取音频焦点")
+            state = state.copy(error = "无法获取音频焦点")
+            publish()
             onActiveChanged?.invoke(false)
             return
         }
-        val start = sentenceIndex.coerceIn(0, ch.sentences.size - 1)
+        var idx = startChunk
+        var frac = startFraction.coerceIn(0f, 1f)
+        if (frac >= 0.985f && idx + 1 < chunks.size) {
+            idx++
+            frac = 0f
+        }
         paused = false
         val token = ++session
-        mode = 0
-        speaker = null
-        publishState(playing = true, preparing = true, speaking = false, error = null,
-            sentenceIndex = start, sentenceCount = ch.sentences.size,
-            chapterIndex = chapterIndex, chapterTitle = ch.title)
+        val s = Session(token, b.id, idx, frac)
+        currentSession = s
+        currentChunkIndex = idx
+        currentChunkFraction = frac
+        val chunk = chunks[idx]
+        val ch = b.chapters[chunk.chapterIndex]
+        val startChar = charForChunkFraction(chunk, frac)
+        val startSentence = ch.sentenceAt(startChar)
+        val startSent = ch.sentences.getOrNull(startSentence)
+        val startSentFraction = if (startSent != null) {
+            val w = weightsFor(chunk.chapterIndex)
+            val ws = w.getOrElse(startSent.start) { 0f }
+            val we = w.getOrElse(startSent.end) { ws }
+            val tw = w.getOrElse(startChar) { ws }
+            if (we > ws) ((tw - ws) / (we - ws)).coerceIn(0f, 1f) else 0f
+        } else 0f
+        chapterIndex = chunk.chapterIndex
+        sentenceIndex = startSentence
+        sentenceFraction = startSentFraction
+        state = state.copy(
+            bookId = b.id,
+            bookTitle = b.title,
+            chapterIndex = chunk.chapterIndex,
+            chapterTitle = ch.title,
+            chapterCount = b.chapters.size,
+            sentenceIndex = startSentence,
+            sentenceCount = ch.sentences.size,
+            playing = true,
+            preparing = true,
+            speaking = false,
+            preloading = true,
+            buffering = false,
+            preloadBufferedMs = 0L,
+            preloadTargetMs = INITIAL_PRELOAD_MS,
+            bufferedAheadMs = 0L,
+            chunkIndex = idx,
+            chunkCount = chunks.size,
+            error = null,
+        )
+        publish()
         notifyHighlight()
         onActiveChanged?.invoke(true)
-        Thread({ producer(token, b, chapterIndex, start) }, "reading-producer").start()
+        s.prefetchThread = Thread({ prefetchLoop(s) }, "chunk-prefetch").also { it.start() }
+        s.feedThread = Thread({ feedLoop(s) }, "chunk-feeder").also { it.start() }
     }
 
-    /** 只停止声音和 producer，不动当前书/位置。 */
-    private fun stopPlaybackOnly() {
+    private fun cancelCurrentSession() {
+        val s = currentSession ?: return
+        currentSession = null
+        s.cancelled = true
+        s.canceller?.cancel()
+        s.canceller = null
+        synchronized(s.lock) { s.lock.notifyAll() }
+        s.prefetchThread?.interrupt()
+        s.feedThread?.interrupt()
+        s.speaker?.cancel()
+        player.stop()
+        s.archive?.close()
+        s.archive = null
+    }
+
+    private fun stopPlayback(clearBook: Boolean) {
         paused = true
         ++session
-        currentCanceller?.cancel()
-        currentCanceller = null
-        speaker?.cancel()
-        speaker = null
-        player.stop()
-        mode = 0
-    }
-
-    private fun stopInternal(clearBook: Boolean) {
-        stopPlaybackOnly()
+        cancelCurrentSession()
         saveProgress(force = true)
         abandonFocus()
         if (clearBook) {
             book = null
+            chunks = emptyList()
+            chunkCharsBuilt = -1
             chapterIndex = 0
             sentenceIndex = 0
-            fraction = 0f
+            currentChunkIndex = 0
+            currentChunkFraction = 0f
             state = PlayerState()
             publish()
         }
     }
 
-    // ---------------- 内部：合成/播放 ----------------
+    // ---------------- 合成线程 ----------------
 
-    private fun producer(token: Int, b: Book, chIdx: Int, start: Int) {
-        val chapter = b.chapters.getOrNull(chIdx) ?: return
-        var first = true
+    private inner class Session(
+        val token: Int,
+        val bookId: String,
+        val startChunk: Int,
+        val startFraction: Float,
+    ) {
+        val lock = Object()
+        @Volatile var synthIndex = startChunk
+        @Volatile var feedIndex = startChunk
+        @Volatile var curChunk = startChunk
+        @Volatile var curFraction = startFraction
+        @Volatile var bufferAheadMs = 0L
+        @Volatile var error: String? = null
+        @Volatile var preloadReady = false
+        @Volatile var cancelled = false
+        val durations = HashMap<Int, Long>()
+        val baseFractions = HashMap<Int, Float>()
+        @Volatile var canceller: TtsClient.Canceller? = null
+        @Volatile var speaker: AudioPlayer.Speaker? = null
+        @Volatile var speakerRate = 0
+        @Volatile var archive: BookAudioStore.SessionArchive? = null
+        @Volatile var archiveModel = ""
+        @Volatile var prefetchThread: Thread? = null
+        @Volatile var feedThread: Thread? = null
+    }
+
+    private fun isCurrent(s: Session): Boolean =
+        !s.cancelled && !paused && s.token == session
+
+    private fun targetPreloadMs(): Long =
+        settings.preloadMinutes().coerceIn(1, 60) * 60_000L
+
+    private fun prefetchLoop(s: Session) {
         try {
-            for (i in start until chapter.sentences.size) {
-                if (!isCurrent(token)) return
-                val text = chapter.sentences[i].text.trim()
-                if (text.isEmpty()) continue
-                main.post {
-                    if (!isCurrent(token)) return@post
-                    sentenceIndex = i
-                    fraction = 0f
-                    state = state.copy(sentenceIndex = i, preparing = first, speaking = state.speaking)
-                    publish()
-                    notifyHighlight()
+            while (isCurrent(s)) {
+                val idx = s.synthIndex
+                if (idx >= chunks.size) {
+                    synchronized(s.lock) { s.lock.notifyAll() }
+                    return
                 }
-                val audio = fetchAudio(token, text) ?: return
-                if (!isCurrent(token)) return
-                ensureOutput(token, audio)
-                if (!isCurrent(token)) return
-
-                if (mode == 2) {
-                    // mp3/aac：按段交给 MediaPlayer，段间不可避免有一点间隙
-                    val latch = CountDownLatch(1)
-                    player.play(
-                        contentType = audio.contentType,
-                        bytes = audio.bytes,
-                        onLevel = {},
-                        onProgress = { played, total ->
-                            if (total > 0) reportProgress(token, i, played.toFloat() / total)
-                        },
-                        onStarted = {
-                            main.post {
-                                if (!isCurrent(token)) return@post
-                                state = state.copy(preparing = false, speaking = true, playing = true)
-                                publish()
-                            }
-                        },
-                        onDone = { latch.countDown() },
-                        speed = settings.tts().speed,
-                    )
-                    while (isCurrent(token) && latch.count > 0L) {
-                        runCatching { latch.await(200, TimeUnit.MILLISECONDS) }
+                if (idx > s.startChunk) {
+                    val wait = synchronized(s.lock) {
+                        while (isCurrent(s) && s.bufferAheadMs >= targetPreloadMs() && s.bufferAheadMs > 0) {
+                            s.lock.wait(400)
+                        }
+                        !isCurrent(s)
                     }
-                    if (!isCurrent(token)) return
-                    reportProgress(token, i, 1f)
-                } else {
-                    val sp = speaker ?: return
-                    val pcm = pcmData(audio.bytes, audio.contentType)
-                    if (pcm.isEmpty()) continue
-                    val pushed = sp.push(i, pcm, true, pcm.size)
-                    if (!pushed) return
-                    first = false
+                    if (wait) return
                 }
+                val chunk = chunks[idx]
+                val entry = fetchChunk(s, idx, chunk) ?: return
+                synchronized(s.lock) {
+                    s.durations[idx] = entry.info.durationMs.takeIf { it > 0 }
+                        ?: estimateChunkMs(chunk)
+                    s.synthIndex = idx + 1
+                    s.bufferAheadMs = computeBuffer(s)
+                    s.lock.notifyAll()
+                }
+                publishPreload(s)
             }
-            if (!isCurrent(token)) return
-            if (mode == 1) speaker?.finish()
-            if (!isCurrent(token)) return
-            main.post { if (isCurrent(token)) onChapterFinished(token, b, chIdx) }
         } catch (e: Exception) {
-            if (!isCurrent(token)) return
-            val msg = e.message ?: e.javaClass.simpleName
+            if (isCurrent(s)) fail(s, e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun feedLoop(s: Session) {
+        try {
+            // 先等一小段音频，避免一开口就 underrun；之后预取会在后台继续跑。
+            while (isCurrent(s) && !s.preloadReady) {
+                val enough = synchronized(s.lock) {
+                    s.bufferAheadMs >= INITIAL_PRELOAD_MS ||
+                        s.synthIndex >= chunks.size ||
+                        (s.synthIndex > s.startChunk && s.bufferAheadMs > 0 &&
+                            s.bufferAheadMs >= min(INITIAL_PRELOAD_MS, 6_000L))
+                }
+                if (enough || s.error != null) {
+                    s.preloadReady = true
+                    break
+                }
+                synchronized(s.lock) { s.lock.wait(200) }
+            }
+            if (!isCurrent(s)) return
+            s.preloadReady = true
             main.post {
-                if (!isCurrent(token)) return@post
-                paused = true
-                ++session
-                speaker = null
-                player.stop()
+                if (!isCurrent(s)) return@post
                 state = state.copy(
-                    playing = false, preparing = false, speaking = false,
-                    error = msg,
+                    playing = true,
+                    preparing = false,
+                    preloading = false,
+                    buffering = false,
+                    preloadBufferedMs = s.bufferAheadMs,
+                    bufferedAheadMs = s.bufferAheadMs,
                 )
                 publish()
-                saveProgress(force = true)
-                onActiveChanged?.invoke(false)
             }
-        }
-    }
 
-    private fun ensureOutput(token: Int, audio: TtsCache.Entry) {
-        val pcm = isPcm(audio.contentType)
-        if (mode == 0) {
-            if (pcm) {
-                mode = 1
-                speakerRate = pcmRate(audio.contentType, audio.bytes)
-                speaker = newSpeaker(token, speakerRate)
-            } else {
-                mode = 2
-            }
-        } else if (mode == 1 && pcm) {
-            val rate = pcmRate(audio.contentType, audio.bytes)
-            if (rate != speakerRate) {
-                // 极少数服务端会换采样率；重开通道，避免变速/爆音
-                speaker?.cancel()
-                speakerRate = rate
-                speaker = newSpeaker(token, rate)
-            }
-        }
-    }
-
-    private fun newSpeaker(token: Int, rate: Int): AudioPlayer.Speaker {
-        return player.speaker(
-            sampleRate = rate,
-            onLevel = {},
-            onStarted = {
-                main.post {
-                    if (!isCurrent(token)) return@post
-                    state = state.copy(preparing = false, speaking = true, playing = true)
-                    publish()
+            while (isCurrent(s)) {
+                // 最多只把当前播放块之后的 1 块推进播放通道，避免大块把内存撑爆。
+                synchronized(s.lock) {
+                    while (isCurrent(s) && s.feedIndex - s.curChunk >= 2) {
+                        s.lock.wait(300)
+                    }
                 }
-            },
-            onProgress = { seg, frac -> reportProgress(token, seg, frac) },
-            onDone = {},
-            speed = settings.tts().speed,
-        )
+                if (!isCurrent(s)) return
+                val idx = s.feedIndex
+                if (idx >= chunks.size) break
+                synchronized(s.lock) {
+                    while (isCurrent(s) && idx >= s.synthIndex && s.error == null) {
+                        s.lock.wait(250)
+                    }
+                }
+                if (!isCurrent(s)) return
+                s.error?.let { throw IllegalStateException(it) }
+                val chunk = chunks[idx]
+                val entry = getCached(s, idx, chunk)
+                    ?: throw IllegalStateException("音频块未就绪")
+                appendArchive(s, entry)
+                if (AudioMeta.isPcm(entry.contentType)) {
+                    ensureSpeaker(s, entry)
+                    val speaker = s.speaker ?: throw IllegalStateException("播放通道未就绪")
+                    var data = AudioMeta.pcmBytes(entry.contentType, entry.bytes)
+                    var base = 0f
+                    if (idx == s.startChunk && s.startFraction > 0.001f) {
+                        val frame = (entry.info.channels * (entry.info.bits / 8)).coerceAtLeast(2)
+                        var off = (data.size.toLong() * s.startFraction).toInt()
+                        off = (off / frame) * frame
+                        off = off.coerceIn(0, (data.size / frame) * frame)
+                        data = data.copyOfRange(off, data.size)
+                        base = s.startFraction
+                    }
+                    s.baseFractions[idx] = base
+                    if (!speaker.push(idx, data, true, data.size)) return
+                } else {
+                    playCompressedChunk(s, idx, entry)
+                    if (!isCurrent(s)) return
+                }
+                s.feedIndex = idx + 1
+                synchronized(s.lock) {
+                    s.bufferAheadMs = computeBuffer(s)
+                    s.lock.notifyAll()
+                }
+                publishPreload(s)
+            }
+            if (!isCurrent(s)) return
+            s.speaker?.finish()
+            if (isCurrent(s)) finishBook()
+        } catch (e: Exception) {
+            if (isCurrent(s)) fail(s, e.message ?: e.javaClass.simpleName)
+        }
     }
 
-    private fun fetchAudio(token: Int, text: String): TtsCache.Entry? {
+    private fun fetchChunk(s: Session, idx: Int, chunk: SpeechChunk): BookAudioStore.Entry? {
+        val b = book ?: return null
+        val text = chunk.text(b).trim()
+        if (text.isEmpty()) return BookAudioStore.Entry(
+            "audio/pcm;rate=24000;channels=1", ByteArray(0),
+            AudioMeta.inspect("audio/pcm;rate=24000;channels=1", ByteArray(0))
+        )
         val cfg = settings.tts()
         if (!cfg.configured) throw IllegalStateException("请先在设置里配置 TTS 服务")
-        if (cache.maxMb != settings.cacheCapMb()) cache = TtsCache(app, settings.cacheCapMb())
-        val key = cache.key("${cfg.baseUrl}|${cfg.model}", cfg.voice, 1f, text)
-        cache.get(key)?.let { return it }
-        if (!isCurrent(token)) return null
+        val key = audio.chunkKey(cfg.baseUrl, cfg.model, cfg.voice, text)
+        audio.get(s.bookId, key)?.let { return it }
+        if (!isCurrent(s)) return null
         val canceller = TtsClient.Canceller()
-        currentCanceller = canceller
-        return try {
-            val audio = TtsClient.synthesize(
+        s.canceller = canceller
+        try {
+            val out = TtsClient.synthesize(
                 base = cfg.baseUrl,
                 key = cfg.apiKey,
                 model = cfg.model,
                 voice = cfg.voice,
                 text = text,
                 speed = cfg.speed,
-                readTimeoutMs = cfg.timeoutSec * 1000,
+                readTimeoutMs = timeoutFor(cfg.timeoutSec, text.length),
                 canceller = canceller,
             )
-            if (!isCurrent(token)) return null
-            cache.put(key, audio.contentType, audio.bytes)
-            TtsCache.Entry(audio.contentType, audio.bytes)
-        } finally {
-            currentCanceller = null
-        }
-    }
-
-    private fun onChapterFinished(token: Int, b: Book, chIdx: Int) {
-        if (!isCurrent(token)) return
-        saveProgress(force = true)
-        if (chIdx + 1 < b.chapters.size) {
-            chapterIndex = chIdx + 1
-            sentenceIndex = 0
-            fraction = 0f
-            val next = b.chapters[chapterIndex]
-            state = state.copy(
-                chapterIndex = chapterIndex, chapterTitle = next.title,
-                sentenceIndex = 0, sentenceCount = next.sentences.size,
-                playing = false, preparing = false, speaking = false,
+            if (!isCurrent(s)) return null
+            val info = AudioMeta.inspect(out.contentType, out.bytes)
+            audio.put(
+                s.bookId, key, out.contentType, out.bytes,
+                BookAudioStore.ChunkMeta(
+                    contentType = out.contentType,
+                    durationMs = info.durationMs,
+                    sampleRate = info.sampleRate,
+                    channels = info.channels,
+                    bits = info.bits,
+                    pcm = info.pcm,
+                    chapterIndex = chunk.chapterIndex,
+                    indexInChapter = chunk.indexInChapter,
+                    startChar = chunk.startChar,
+                    endChar = chunk.endChar,
+                ),
             )
-            publish()
-            notifyHighlight()
-            startPlayback()
-        } else {
-            paused = true
-            state = state.copy(playing = false, preparing = false, speaking = false)
-            publish()
-            listeners.forEach { it.onFinished() }
-            onActiveChanged?.invoke(false)
+            return audio.get(s.bookId, key)
+                ?: BookAudioStore.Entry(out.contentType, out.bytes, info)
+        } finally {
+            s.canceller = null
         }
     }
 
-    private fun reportProgress(token: Int, seg: Int, frac: Float) {
+    private fun getCached(s: Session, idx: Int, chunk: SpeechChunk): BookAudioStore.Entry? {
+        val b = book ?: return null
+        val cfg = settings.tts()
+        val key = audio.chunkKey(cfg.baseUrl, cfg.model, cfg.voice, chunk.text(b).trim())
+        return audio.get(s.bookId, key)
+    }
+
+    private fun ensureSpeaker(s: Session, entry: BookAudioStore.Entry) {
+        val rate = entry.info.sampleRate.takeIf { it in 8000..192000 } ?: 24000
+        if (s.speaker != null && s.speakerRate == rate) return
+        s.speaker?.cancel()
+        s.speakerRate = rate
+        s.speaker = player.speaker(
+            sampleRate = rate,
+            onLevel = {},
+            onStarted = {
+                main.post {
+                    if (!isCurrent(s)) return@post
+                    state = state.copy(playing = true, preparing = false, preloading = false)
+                    publish()
+                }
+            },
+            onProgress = { seg, frac -> onChunkProgress(s, seg, frac) },
+            onDone = {},
+            speed = settings.tts().speed,
+            onBuffering = { buf ->
+                main.post {
+                    if (!isCurrent(s)) return@post
+                    if (state.buffering != buf) {
+                        state = state.copy(buffering = buf)
+                        publish()
+                    }
+                }
+            },
+        )
+    }
+
+    private fun playCompressedChunk(s: Session, idx: Int, entry: BookAudioStore.Entry) {
+        var base = 0f
+        if (idx == s.startChunk) base = s.startFraction
+        s.baseFractions[idx] = base
+        player.play(
+            contentType = entry.contentType,
+            bytes = entry.bytes,
+            onLevel = {},
+            onProgress = { played, total ->
+                if (total > 0) {
+                    onChunkProgress(s, idx, (played.toFloat() / total).coerceIn(0f, 1f))
+                }
+            },
+            onDone = {},
+            speed = settings.tts().speed,
+        )
+    }
+
+    private fun onChunkProgress(s: Session, seg: Int, frac: Float) {
+        if (!isCurrent(s)) return
+        val b = book ?: return
+        val chunk = chunks.getOrNull(seg) ?: return
+        val base = s.baseFractions[seg] ?: 0f
+        val effective = (base + frac.coerceIn(0f, 1f) * (1f - base)).coerceIn(0f, 1f)
+        val ch = b.chapters.getOrNull(chunk.chapterIndex) ?: return
+        val w = weightsFor(chunk.chapterIndex)
+        val lo = w.getOrElse(chunk.startChar) { 0f }
+        val hi = w.getOrElse(chunk.endChar) { lo }
+        val targetWeight = lo + (hi - lo) * effective
+        val targetChar = weightIndex(w, targetWeight).coerceIn(0, ch.text.length)
+        val si = ch.sentenceAt(targetChar)
+        val sent = ch.sentences.getOrNull(si)
+        val sf = if (sent != null) {
+            val ws = w.getOrElse(sent.start) { targetWeight }
+            val we = w.getOrElse(sent.end) { ws }
+            if (we > ws) ((targetWeight - ws) / (we - ws)).coerceIn(0f, 1f) else 0f
+        } else 0f
+
+        chapterIndex = chunk.chapterIndex
+        sentenceIndex = si
+        sentenceFraction = sf
+        currentChunkIndex = seg
+        currentChunkFraction = effective
+        s.curChunk = seg
+        s.curFraction = effective
+        synchronized(s.lock) {
+            s.bufferAheadMs = computeBuffer(s)
+            s.lock.notifyAll()
+        }
         main.post {
-            if (!isCurrent(token)) return@post
-            val f = frac.coerceIn(0f, 1f)
-            val changed = seg != sentenceIndex || abs(f - fraction) > 0.005f
-            sentenceIndex = seg
-            fraction = f
-            if (state.sentenceIndex != seg) {
-                state = state.copy(sentenceIndex = seg)
+            if (!isCurrent(s)) return@post
+            val changed = state.chapterIndex != chunk.chapterIndex ||
+                state.sentenceIndex != si || state.chunkIndex != seg
+            if (changed) {
+                state = state.copy(
+                    chapterIndex = chunk.chapterIndex,
+                    chapterTitle = ch.title,
+                    sentenceIndex = si,
+                    sentenceCount = ch.sentences.size,
+                    chunkIndex = seg,
+                    chunkCount = chunks.size,
+                )
                 publish()
             }
-            if (changed) listeners.forEach { it.onHighlight(chapterIndex, seg, f) }
+            listeners.forEach { it.onHighlight(chunk.chapterIndex, si, sf) }
             val now = System.currentTimeMillis()
             if (now - lastSaved > 4000L) {
                 lastSaved = now
@@ -564,120 +845,170 @@ class ReadingController(context: Context) {
         }
     }
 
+    private fun computeBuffer(s: Session): Long {
+        var ms = 0L
+        val cur = s.curChunk
+        if (cur < s.synthIndex) {
+            val dur = durationOf(s, cur)
+            ms += ((1f - s.curFraction.coerceIn(0f, 1f)) * dur).toLong()
+        }
+        for (i in (cur + 1) until s.synthIndex) ms += durationOf(s, i)
+        return ms.coerceAtLeast(0L)
+    }
+
+    private fun durationOf(s: Session, idx: Int): Long =
+        s.durations[idx] ?: chunks.getOrNull(idx)?.let { estimateChunkMs(it) } ?: 0L
+
+    private fun estimateChunkMs(chunk: SpeechChunk): Long {
+        val len = (chunk.endChar - chunk.startChar).coerceAtLeast(0)
+        return max(800L, len * 90L)
+    }
+
+    private fun publishPreload(s: Session) {
+        main.post {
+            if (!isCurrent(s)) return@post
+            state = state.copy(
+                preloadBufferedMs = s.bufferAheadMs,
+                bufferedAheadMs = s.bufferAheadMs,
+                preloadTargetMs = if (!s.preloadReady) INITIAL_PRELOAD_MS else targetPreloadMs(),
+                chunkIndex = s.curChunk,
+                chunkCount = chunks.size,
+            )
+            publish()
+        }
+    }
+
+    private fun appendArchive(s: Session, entry: BookAudioStore.Entry) {
+        val cfg = settings.tts()
+        val model = cfg.model.ifBlank { "unknown" }
+        var ar = s.archive
+        if (ar == null || s.archiveModel != model || !ar.compatible(entry)) {
+            ar?.close()
+            ar = audio.newArchive(s.bookId, model, book?.title.orEmpty(), entry)
+            s.archive = ar
+            s.archiveModel = model
+        }
+        ar.append(entry)
+    }
+
+    private fun timeoutFor(configSec: Int, chars: Int): Int {
+        val byChars = 30_000L + chars.toLong() * 150L
+        return max(configSec * 1000L, byChars).coerceAtMost(900_000L).toInt()
+    }
+
+    private fun fail(s: Session, message: String) {
+        main.post {
+            if (s.token != session) return@post
+            paused = true
+            ++session
+            cancelCurrentSession()
+            state = state.copy(
+                playing = false, preparing = false, speaking = false,
+                preloading = false, buffering = false, error = message,
+            )
+            publish()
+            saveProgress(force = true)
+            onActiveChanged?.invoke(false)
+        }
+    }
+
+    private fun finishBook() {
+        paused = true
+        ++session
+        cancelCurrentSession()
+        chapterIndex = (book?.chapters?.size ?: 1).coerceAtLeast(1) - 1
+        sentenceIndex = book?.chapters?.getOrNull(chapterIndex)?.sentences?.lastIndex?.coerceAtLeast(0) ?: 0
+        val b = book
+        if (b != null) {
+            store.saveProgress(
+                b.id,
+                Position(
+                    chapterIndex, sentenceIndex, 1f, System.currentTimeMillis(), 100,
+                    charOffset = b.chapters.getOrNull(chapterIndex)?.text?.length ?: 0,
+                ),
+            )
+        }
+        abandonFocus()
+        state = state.copy(
+            playing = false, preparing = false, speaking = false,
+            preloading = false, buffering = false, preloadBufferedMs = 0L,
+        )
+        publish()
+        listeners.forEach { it.onFinished() }
+        onActiveChanged?.invoke(false)
+    }
+
+    // ---------------- 进度/权重 ----------------
+
+    private fun weightsFor(chapter: Int): FloatArray =
+        weightCache.getOrPut(chapter) {
+            val text = book?.chapters?.getOrNull(chapter)?.text.orEmpty()
+            val cum = FloatArray(text.length + 1)
+            var acc = 0f
+            for (i in text.indices) {
+                acc += 1f
+                acc += when (text[i]) {
+                    '。', '！', '？', '!', '?', '\n' -> 3.5f
+                    '，', '、', '；', '：', ',', ';', ':', '…' -> 1.5f
+                    else -> 0f
+                }
+                cum[i + 1] = acc
+            }
+            cum
+        }
+
+    private fun weightIndex(cum: FloatArray, target: Float): Int {
+        val n = cum.size - 1
+        if (n <= 0) return 0
+        var lo = 0
+        var hi = n
+        while (lo < hi) {
+            val mid = (lo + hi) / 2
+            if (cum[mid] < target) lo = mid + 1 else hi = mid
+        }
+        return lo
+    }
+
     private fun saveProgress(force: Boolean) {
         val b = book ?: return
-        if (!force && b.id.isEmpty()) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastSaved < 3500L) return
+        lastSaved = now
+        val chunk = chunks.getOrNull(currentChunkIndex)
+        val ch = b.chapters.getOrNull(chapterIndex)
+        val charOffset = if (chunk != null && ch != null) {
+            val w = weightsFor(chunk.chapterIndex)
+            val lo = w.getOrElse(chunk.startChar) { 0f }
+            val hi = w.getOrElse(chunk.endChar) { lo }
+            val target = lo + (hi - lo) * currentChunkFraction
+            weightIndex(w, target)
+        } else ch?.sentences?.getOrNull(sentenceIndex)?.start ?: 0
         store.saveProgress(
             b.id,
             Position(
-                chapterIndex, sentenceIndex, fraction, System.currentTimeMillis(),
+                chapter = chapterIndex,
+                sentence = sentenceIndex,
+                fraction = sentenceFraction,
+                updatedAt = now,
                 percent = b.percent(chapterIndex, sentenceIndex),
+                charOffset = charOffset,
             ),
         )
-    }
-
-    private fun isCurrent(token: Int): Boolean = token == session && !paused
-
-    // ---------------- 音频格式 ----------------
-
-    private fun isPcm(ct: String): Boolean {
-        val t = ct.lowercase()
-        return t.contains("pcm") || t.contains("l16") || t.contains("wav") || t.contains("wave")
-    }
-
-    private fun pcmRate(ct: String, bytes: ByteArray): Int {
-        Regex("rate=(\\d+)").find(ct)?.groupValues?.getOrNull(1)?.toIntOrNull()?.let { return it }
-        // WAV：从 fmt 块读采样率
-        if (ct.contains("wav") || (bytes.size > 12 && bytes[0] == 'R'.code.toByte() &&
-                bytes[1] == 'I'.code.toByte() && bytes[2] == 'F'.code.toByte() &&
-                bytes[3] == 'F'.code.toByte())
-        ) {
-            var p = 12
-            while (p + 8 <= bytes.size) {
-                val id = String(bytes, p, 4, Charsets.US_ASCII)
-                val size = (bytes[p + 4].toInt() and 0xff) or
-                    ((bytes[p + 5].toInt() and 0xff) shl 8) or
-                    ((bytes[p + 6].toInt() and 0xff) shl 16) or
-                    ((bytes[p + 7].toInt() and 0xff) shl 24)
-                if (id == "fmt " && p + 16 <= bytes.size) {
-                    val r = (bytes[p + 12].toInt() and 0xff) or
-                        ((bytes[p + 13].toInt() and 0xff) shl 8) or
-                        ((bytes[p + 14].toInt() and 0xff) shl 16) or
-                        ((bytes[p + 15].toInt() and 0xff) shl 24)
-                    if (r in 8000..192000) return r
-                }
-                p += 8 + size + (size and 1)
-            }
-        }
-        return 24000
-    }
-
-    private fun pcmData(bytes: ByteArray, ct: String): ByteArray {
-        val isWav = ct.contains("wav") || (bytes.size >= 12 &&
-            bytes[0] == 'R'.code.toByte() && bytes[1] == 'I'.code.toByte() &&
-            bytes[2] == 'F'.code.toByte() && bytes[3] == 'F'.code.toByte())
-        if (!isWav) return bytes
-        var p = 12
-        while (p + 8 <= bytes.size) {
-            val id = String(bytes, p, 4, Charsets.US_ASCII)
-            val size = (bytes[p + 4].toInt() and 0xff) or
-                ((bytes[p + 5].toInt() and 0xff) shl 8) or
-                ((bytes[p + 6].toInt() and 0xff) shl 16) or
-                ((bytes[p + 7].toInt() and 0xff) shl 24)
-            if (id == "data") {
-                val start = (p + 8).coerceAtMost(bytes.size)
-                return bytes.copyOfRange(start, bytes.size)
-            }
-            p += 8 + size + (size and 1)
-        }
-        return bytes
-    }
-
-    // ---------------- 状态/焦点 ----------------
-
-    private fun publishState(
-        playing: Boolean = state.playing,
-        preparing: Boolean = state.preparing,
-        speaking: Boolean = state.speaking,
-        error: String? = state.error,
-        chapterIndex: Int = this.chapterIndex,
-        chapterTitle: String = book?.chapters?.getOrNull(chapterIndex)?.title.orEmpty(),
-        sentenceIndex: Int = this.sentenceIndex,
-        sentenceCount: Int = book?.chapters?.getOrNull(chapterIndex)?.sentences?.size ?: 0,
-    ) {
-        val b = book
-        state = state.copy(
-            bookId = b?.id ?: state.bookId,
-            bookTitle = b?.title ?: state.bookTitle,
-            chapterIndex = chapterIndex,
-            chapterTitle = chapterTitle,
-            chapterCount = b?.chapters?.size ?: state.chapterCount,
-            sentenceIndex = sentenceIndex,
-            sentenceCount = sentenceCount,
-            playing = playing,
-            preparing = preparing,
-            speaking = speaking,
-            error = error,
-            loading = false,
-        )
-        publish()
-    }
-
-    private fun publish() {
-        val s = state
-        listeners.forEach { it.onState(s) }
     }
 
     private fun notifyHighlight() {
         val c = chapterIndex
         val s = sentenceIndex
-        val f = fraction
+        val f = sentenceFraction
         listeners.forEach { it.onHighlight(c, s, f) }
     }
 
-    private fun post(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) block() else main.post(block)
+    private fun publish() {
+        val snap = state
+        listeners.forEach { it.onState(snap) }
     }
+
+    // ---------------- 音频焦点 ----------------
 
     private fun requestFocus(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -695,9 +1026,7 @@ class ReadingController(context: Context) {
         } else {
             @Suppress("DEPRECATION")
             audioManager.requestAudioFocus(
-                focusListener,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN,
+                focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN,
             ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         }
     }
@@ -710,5 +1039,10 @@ class ReadingController(context: Context) {
             @Suppress("DEPRECATION")
             audioManager.abandonAudioFocus(focusListener)
         }
+    }
+
+    companion object {
+        /** 开口前至少缓冲这么多；预取目标在后台继续跑。 */
+        private const val INITIAL_PRELOAD_MS = 20_000L
     }
 }

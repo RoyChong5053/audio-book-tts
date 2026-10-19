@@ -193,6 +193,7 @@ class BookStore(private val context: Context) {
                 fraction = o.optDouble("f", 0.0).toFloat(),
                 updatedAt = o.optLong("t", 0L),
                 percent = o.optInt("pc", 0),
+                charOffset = o.optInt("co", -1),
             )
         }.getOrDefault(Position())
     }
@@ -205,6 +206,7 @@ class BookStore(private val context: Context) {
                 .put("s", pos.sentence)
                 .put("f", pos.fraction.toDouble())
                 .put("pc", pos.percent)
+                .put("co", pos.charOffset)
                 .put("t", System.currentTimeMillis())
                 .toString()
         ).apply()

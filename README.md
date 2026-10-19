@@ -10,12 +10,17 @@ TTS 与连续播放部分移植自 [DeskSpirit](../DeskSpirit) 的已验证实�
 - **KTV 高亮**：按句合成，播放时按「标点加权」的字符时长把音频进度换算成文字位置；已读变亮、当前句加背景、自动滚动。
 - **点哪读哪**：长按正文任意位置，从那一句开始朗读；上一句/下一句、上一章/下一章、目录跳转。
 - **主题**：暗色、纸质、夜间纯黑、护眼绿；字号、行距、页边距、衬线/无衬线可调。
-- **进度与书签**：自动记录到句子级；手动书签可加备注，支持跳转/删除。
+- **进度与书签**：自动记录到句子级并保存字符偏移，大块合成时也能从块中间恢复；手动书签可加备注，支持跳转/删除。
+- **书架 mini-player**：主页底部常驻当前书播放/暂停、上一句/下一句、停止，点条目进入阅读页。
 - **后台听书**：前台服务 + MediaSession + 通知栏（上一句/暂停/下一句/停止）、锁屏控制、耳机拔插暂停、音频焦点。
 - **睡眠定时**：15 / 30 / 45 / 60 分钟后自动暂停。
-- **音频缓存**：按 `model + voice + 文本` 缓存每一句，重听不重复合成；可设置容量上限并一键清空。
-- **TTS 配置**：OpenAI 兼容 `/audio/speech`；Base URL / API Key / Model / Voice / 语速 / 超时；支持拉取 `/v1/models` 和测试朗读。
+- **音频缓存**：按 `model + voice + 文本` 缓存每个 chunk，重听不重复合成；**不自动删除、不设容量上限**，只保留手动清理入口。
+- **TTS 配置**：OpenAI 兼容 `/audio/speech`；Base URL / API Key / Model / Voice / 语速 / 超时；支持拉取 `/v1/models` 和测试朗读。\n- **API Profile**：可新建、复制、重命名、删除多套 TTS 端点，切换 profile 自动带出 Base URL / Key / Model / Voice；旧版单套配置首次启动自动迁移为「默认」。
+- **分块合成**：小 80 字（CPU/Kokoro）、中 300 字（本地 GPU）、大 2000 字（云端），也支持自定义；每章第一块压到 80 字以内，先快速开口。
+- **预读取**：后台最多领先播放进度合成 1–60 分钟（默认 5 分钟）；加载/慢设备可设 30 分钟。预取有上限，暂停后不再调用 TTS，避免云端无限烧 token。
+- **预加载提示**：点播放先显示“正在预加载… 已缓冲 x/y”，缓冲够了再开始，边播边继续合成。
 - **语速**：在本机播放端变速，不向服务端发送 `speed`（`audio.cpp` / `qwen3-tts` 会拒绝该参数）。
+- **有声书归档**：每次播放/暂停周期按 TTS 模型生成一个 WAV/MP3 归档，追加写入 `Android/media/.../books/<bookId>/audio/<model>/`，付费音频不自动删除。
 
 ## 支持的格式
 
@@ -69,7 +74,7 @@ app/src/main/java/com/roychong/audiobook/
 ├── tts/
 │   ├── Http.kt                  URL 拼接与连接
 │   ├── TtsClient.kt             /audio/speech，可取消
-│   └── TtsCache.kt              句子级磁盘缓存 + LRU 清理
+│   └── BookAudioStore.kt        chunk 缓存 + 每次播放的 WAV/MP3 归档
 └── player/
     ├── AudioPlayer.kt           AudioTrack 连续通道、预缓冲、进度
     ├── PcmFramer.kt             跨块 16-bit 帧对齐
@@ -94,7 +99,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 - 书库 / 正文 JSON / 封面：`files/audiobook/`（应用私有）
 - 原始导入文件：`files/audiobook/sources/`
-- 音频缓存：`Android/data/com.roychong.audiobook/files/tts_cache/segments/`
+- 音频缓存 / 有声书归档：`Android/media/com.roychong.audiobook/books/<bookId>/`
 - 设置、进度、书签：SharedPreferences
 
 ## 已知限制
@@ -102,6 +107,8 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - 扫描版 PDF 没有文字层，导入时会提示需要 OCR。
 - PDF 的复杂多栏排版只能做启发式重排；正文顺序可能不完美。
 - KTV 高亮是按字符权重估算的，不是强制对齐；极快/极慢语速下可能有半句偏差。
+- 大块合成时，暂停后恢复是按字符权重估算音频位置，通常落在当前句附近。
+- 归档是“每次播放/暂停一个文件”，不做严格的无缝合并，方便同一本书用不同模型试听。
 - MOBI/AZW3/DOCX 未支持。
 - 只接在线 TTS；断网时不能朗读。
 - 语速在本地变速，改变速度时音高会有轻微变化。

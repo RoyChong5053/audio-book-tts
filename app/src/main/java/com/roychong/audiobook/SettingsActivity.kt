@@ -15,10 +15,13 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import android.app.AlertDialog
+import android.graphics.drawable.GradientDrawable
+import android.text.InputType
+import android.widget.AdapterView
 import org.json.JSONObject
 import com.roychong.audiobook.player.AudioPlayer
 import com.roychong.audiobook.player.PlaybackService
-import com.roychong.audiobook.tts.TtsCache
+import com.roychong.audiobook.tts.BookAudioStore
 import com.roychong.audiobook.tts.Http
 import com.roychong.audiobook.tts.TtsClient
 import com.roychong.audiobook.ui.ThemeUi
@@ -43,13 +46,21 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var etFontSize: EditText
     private lateinit var etLineSpacing: EditText
     private lateinit var etMargin: EditText
-    private lateinit var etCacheMb: EditText
+    private lateinit var etChunkChars: EditText
+    private lateinit var etPreloadMin: EditText
+    private lateinit var spProfile: Spinner
     private lateinit var spTheme: Spinner
     private lateinit var spFont: Spinner
+    private lateinit var spChunk: Spinner
     private lateinit var swAutoScroll: Switch
     private lateinit var tvTestStatus: TextView
     private lateinit var tvCache: TextView
+    private lateinit var tvCachePath: TextView
     private lateinit var root: View
+
+    private val profiles = ArrayList<TtsProfile>()
+    private var activeProfile = 0
+    private var renderingProfile = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,24 +84,52 @@ class SettingsActivity : AppCompatActivity() {
         etFontSize = findViewById(R.id.etFontSize)
         etLineSpacing = findViewById(R.id.etLineSpacing)
         etMargin = findViewById(R.id.etMargin)
-        etCacheMb = findViewById(R.id.etCacheMb)
+        etChunkChars = findViewById(R.id.etChunkChars)
+        etPreloadMin = findViewById(R.id.etPreloadMin)
+        spProfile = findViewById(R.id.spProfile)
         spTheme = findViewById(R.id.spTheme)
         spFont = findViewById(R.id.spFont)
+        spChunk = findViewById(R.id.spChunk)
         swAutoScroll = findViewById(R.id.swAutoScroll)
         tvTestStatus = findViewById(R.id.tvTestStatus)
         tvCache = findViewById(R.id.tvCache)
+        tvCachePath = findViewById(R.id.tvCachePath)
 
         spTheme.adapter = ThemedSpinnerAdapter(ReaderTheme.entries.map { it.label })
         spFont.adapter = ThemedSpinnerAdapter(
             listOf(getString(R.string.font_serif), getString(R.string.font_sans)),
         )
+        spChunk.adapter = ThemedSpinnerAdapter(ChunkPreset.entries.map { it.label })
+        spProfile.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (renderingProfile) return
+                if (position == activeProfile) return
+                commitProfileFields()
+                activeProfile = position.coerceIn(0, (profiles.size - 1).coerceAtLeast(0))
+                persistProfiles()
+                renderProfileFields()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        findViewById<Button>(R.id.btnRenameProfile).setOnClickListener { renameProfile() }
+        findViewById<Button>(R.id.btnAddProfile).setOnClickListener { addProfile() }
+        findViewById<Button>(R.id.btnDupProfile).setOnClickListener { duplicateProfile() }
+        findViewById<Button>(R.id.btnDelProfile).setOnClickListener { deleteProfile() }
 
         findViewById<Button>(R.id.btnTest).setOnClickListener { testTts() }
         findViewById<Button>(R.id.btnPullModels).setOnClickListener { pullModels() }
         findViewById<Button>(R.id.btnClearCache).setOnClickListener {
-            TtsCache(this, settings.cacheCapMb()).clear()
-            toast(getString(R.string.cache_cleared))
-            refreshCacheInfo()
+            AlertDialog.Builder(this)
+                .setTitle(R.string.cache_clear)
+                .setMessage(R.string.cache_clear_confirm)
+                .setPositiveButton(R.string.delete) { _, _ ->
+                    BookAudioStore(this).clearAll()
+                    toast(getString(R.string.cache_cleared))
+                    refreshCacheInfo()
+                }
+                .setNegativeButton(R.string.cancel, null)
+                .show()
         }
         findViewById<Button>(R.id.btnSave).setOnClickListener { saveAll() }
         findViewById<Button>(R.id.btnReset).setOnClickListener { resetDefaults() }
@@ -98,31 +137,131 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun loadValues() {
         val c = settings.tts()
-        etBase.setText(c.baseUrl)
-        etKey.setText(c.apiKey)
-        etModel.setText(c.model)
-        etVoice.setText(c.voice)
+        profiles.clear()
+        profiles.addAll(settings.ttsProfiles())
+        activeProfile = settings.activeTtsProfileIndex()
+        renderProfileList(activeProfile)
         etSpeed.setText(String.format(Locale.US, "%.2f", c.speed))
         etTimeout.setText(c.timeoutSec.toString())
         etFontSize.setText(settings.fontSize().toString())
         etLineSpacing.setText(String.format(Locale.US, "%.2f", settings.lineSpacing()))
         etMargin.setText(settings.marginDp().toString())
-        etCacheMb.setText(settings.cacheCapMb().toString())
         spTheme.setSelection(ReaderTheme.entries.indexOf(settings.theme()).coerceAtLeast(0))
         spFont.setSelection(if (settings.serif()) 0 else 1)
+        spChunk.setSelection(ChunkPreset.entries.indexOf(settings.chunkPreset()).coerceAtLeast(0))
+        etChunkChars.setText(settings.customChunkChars().toString())
+        etPreloadMin.setText(settings.preloadMinutes().toString())
         swAutoScroll.isChecked = settings.autoScroll()
         refreshCacheInfo()
     }
 
+    private fun renderProfileList(select: Int) {
+        if (profiles.isEmpty()) {
+            profiles.add(TtsProfile())
+        }
+        activeProfile = select.coerceIn(0, profiles.size - 1)
+        renderingProfile = true
+        spProfile.adapter = ThemedSpinnerAdapter(profiles.map { it.name })
+        spProfile.setSelection(activeProfile)
+        renderingProfile = false
+        renderProfileFields()
+    }
+
+    private fun renderProfileFields() {
+        val p = profiles.getOrNull(activeProfile) ?: return
+        etBase.setText(p.baseUrl)
+        etKey.setText(p.apiKey)
+        etModel.setText(p.model)
+        etVoice.setText(p.voice)
+    }
+
+    private fun commitProfileFields() {
+        val i = activeProfile.coerceIn(0, (profiles.size - 1).coerceAtLeast(0))
+        val old = profiles.getOrNull(i) ?: return
+        profiles[i] = old.copy(
+            baseUrl = etBase.text.toString().trim(),
+            apiKey = etKey.text.toString().trim(),
+            model = etModel.text.toString().trim(),
+            voice = etVoice.text.toString().trim(),
+        )
+    }
+
+    private fun uniqueProfileName(want: String, taken: List<TtsProfile>): String {
+        val used = taken.map { it.name }.toSet()
+        if (want !in used) return want
+        var i = 2
+        while ("$want ($i)" in used) i++
+        return "$want ($i)"
+    }
+
+    private fun addProfile() {
+        commitProfileFields()
+        val name = uniqueProfileName(
+            getString(R.string.profile_new, profiles.size + 1),
+            profiles,
+        )
+        profiles.add(TtsProfile(name = name, baseUrl = "", apiKey = "", model = "", voice = ""))
+        renderProfileList(profiles.size - 1)
+        persistProfiles()
+        etBase.requestFocus()
+    }
+
+    private fun duplicateProfile() {
+        commitProfileFields()
+        val src = profiles.getOrNull(activeProfile) ?: return
+        val name = uniqueProfileName(getString(R.string.profile_copy, src.name), profiles)
+        profiles.add(src.copy(name = name))
+        renderProfileList(profiles.size - 1)
+        persistProfiles()
+    }
+
+    private fun deleteProfile() {
+        commitProfileFields()
+        if (profiles.size <= 1) {
+            toast(getString(R.string.profile_keep_one))
+            return
+        }
+        profiles.removeAt(activeProfile.coerceIn(0, profiles.size - 1))
+        renderProfileList((activeProfile - 1).coerceAtLeast(0))
+        persistProfiles()
+    }
+
+    private fun renameProfile() {
+        commitProfileFields()
+        val current = profiles.getOrNull(activeProfile) ?: return
+        val input = EditText(this)
+        input.inputType = InputType.TYPE_CLASS_TEXT
+        input.setText(current.name)
+        input.setSelection(input.text.length)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.profile_rename)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                val raw = input.text.toString().trim()
+                if (raw.isNotEmpty()) {
+                    val others = profiles.filterIndexed { i, _ -> i != activeProfile }
+                    profiles[activeProfile] = current.copy(
+                        name = uniqueProfileName(raw, others),
+                    )
+                    renderProfileList(activeProfile)
+                    persistProfiles()
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun persistProfiles() {
+        settings.saveTtsProfiles(profiles, activeProfile)
+    }
+
     private fun refreshCacheInfo() {
         io.execute {
-            val bytes = TtsCache(this, settings.cacheCapMb()).totalBytes()
+            val store = BookAudioStore(this)
+            val bytes = store.totalBytes()
             main.post {
-                tvCache.text = getString(
-                    R.string.cache_info_fmt,
-                    formatSize(bytes),
-                    "${settings.cacheCapMb()} MB",
-                )
+                tvCache.text = "已用 ${formatSize(bytes)} · 不会自动删除"
+                tvCachePath.text = "位置：${store.root.absolutePath}"
             }
         }
     }
@@ -259,7 +398,10 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun saveAll() {
-        settings.saveTts(readTts())
+        commitProfileFields()
+        val c = readTts()
+        settings.saveTtsProfiles(profiles, activeProfile)
+        settings.saveTtsOptions(c)
         theme = ReaderTheme.entries[spTheme.selectedItemPosition.coerceIn(0, 3)]
         settings.saveTheme(theme)
         settings.saveFontSize(etFontSize.text.toString().toIntOrNull() ?: 19)
@@ -267,7 +409,11 @@ class SettingsActivity : AppCompatActivity() {
         settings.saveMarginDp(etMargin.text.toString().toIntOrNull() ?: 20)
         settings.saveSerif(spFont.selectedItemPosition == 0)
         settings.saveAutoScroll(swAutoScroll.isChecked)
-        settings.saveCacheCapMb(etCacheMb.text.toString().toIntOrNull() ?: 600)
+        settings.saveChunkPreset(
+            ChunkPreset.entries[spChunk.selectedItemPosition.coerceIn(0, ChunkPreset.entries.size - 1)]
+        )
+        settings.saveCustomChunkChars(etChunkChars.text.toString().toIntOrNull() ?: 2000)
+        settings.savePreloadMinutes(etPreloadMin.text.toString().toIntOrNull() ?: 5)
         applyColors()
         refreshCacheInfo()
         toast(getString(R.string.settings_saved))
@@ -275,29 +421,35 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun resetDefaults() {
         val t = TtsConfig()
-        etBase.setText(t.baseUrl)
-        etKey.setText("")
-        etModel.setText(t.model)
-        etVoice.setText(t.voice)
+        profiles.clear()
+        profiles.add(TtsProfile("默认"))
+        renderProfileList(0)
         etSpeed.setText(String.format(Locale.US, "%.2f", t.speed))
         etTimeout.setText(t.timeoutSec.toString())
         etFontSize.setText("19")
         etLineSpacing.setText("1.65")
         etMargin.setText("20")
-        etCacheMb.setText("600")
         spTheme.setSelection(0)
         spFont.setSelection(0)
         swAutoScroll.isChecked = true
+        spChunk.setSelection(ChunkPreset.entries.indexOf(ChunkPreset.MEDIUM))
+        etChunkChars.setText("2000")
+        etPreloadMin.setText("5")
     }
 
     private fun applyColors() {
         ThemeUi.apply(this, theme)
         root.setBackgroundColor(theme.bg)
         tint(root)
+        (spProfile.adapter as? ThemedSpinnerAdapter)?.notifyDataSetChanged()
         (spTheme.adapter as? ThemedSpinnerAdapter)?.notifyDataSetChanged()
         (spFont.adapter as? ThemedSpinnerAdapter)?.notifyDataSetChanged()
+        (spChunk.adapter as? ThemedSpinnerAdapter)?.notifyDataSetChanged()
+        spProfile.setPopupBackgroundDrawable(android.graphics.drawable.ColorDrawable(theme.panel))
         spTheme.setPopupBackgroundDrawable(android.graphics.drawable.ColorDrawable(theme.panel))
         spFont.setPopupBackgroundDrawable(android.graphics.drawable.ColorDrawable(theme.panel))
+        spChunk.setPopupBackgroundDrawable(android.graphics.drawable.ColorDrawable(theme.panel))
+        tvCachePath.setTextColor(theme.dim)
         findViewById<View>(R.id.btnSave).backgroundTintList = ColorStateList.valueOf(theme.accent)
         findViewById<Button>(R.id.btnSave).setTextColor(theme.bg)
         tvTestStatus.setTextColor(theme.dim)
@@ -312,10 +464,21 @@ class SettingsActivity : AppCompatActivity() {
             is EditText -> {
                 v.setTextColor(theme.text)
                 v.setHintTextColor(theme.dim)
+                v.background = fieldDrawable(false)
+                v.minHeight = dp(50)
+                v.setPadding(dp(14), 0, dp(14), 0)
+                v.gravity = android.view.Gravity.CENTER_VERTICAL
+                v.setOnFocusChangeListener { view, focused ->
+                    view.background = fieldDrawable(focused)
+                }
             }
             is Button -> v.setTextColor(theme.accent)
             is TextView -> v.setTextColor(theme.text)
-            is Spinner -> {}
+            is Spinner -> {
+                v.background = fieldDrawable(false)
+                v.minimumHeight = dp(50)
+                v.setPadding(dp(14), 0, dp(14), 0)
+            }
             is ViewGroup -> {
                 for (i in 0 until v.childCount) tint(v.getChildAt(i))
             }
@@ -335,6 +498,14 @@ class SettingsActivity : AppCompatActivity() {
                 it.setBackgroundColor(theme.panel)
             }
     }
+
+    private fun fieldDrawable(focused: Boolean): GradientDrawable = GradientDrawable().apply {
+        cornerRadius = dp(9).toFloat()
+        setColor(theme.fieldBg)
+        setStroke(dp(1), if (focused) theme.accent else theme.fieldBorder)
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     override fun onDestroy() {
         super.onDestroy()

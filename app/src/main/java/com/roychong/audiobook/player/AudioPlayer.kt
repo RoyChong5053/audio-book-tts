@@ -99,6 +99,7 @@ class AudioPlayer(private val context: Context) {
         private val onStarted: () -> Unit,
         private val onProgress: (segment: Int, fraction: Float) -> Unit,
         private val onDone: () -> Unit,
+        private val onBuffering: (Boolean) -> Unit,
     ) {
         private val queue = LinkedBlockingQueue<Chunk>(QUEUE_CHUNKS)
         private val pill = Chunk(-1, ByteArray(0), true, 0)
@@ -229,6 +230,8 @@ class AudioPlayer(private val context: Context) {
             var oddChunks = 0
             var lastReport = 0L
             var sawPill = false
+            var buffering = false
+            var pausedForData = false
 
             // 轨道余量低于这个值才允许垫静音。要盖过这条链路的固有延迟
             // （AudioFlinger mAfLatency≈42ms + HAL mLatency≈214ms）再留些余量。
@@ -335,16 +338,34 @@ class AudioPlayer(private val context: Context) {
                             }
                             continue
                         }
-                        // 余量真的见底（合成/网络卡住）：垫静音总好过 underrun。
-                        // underrun 会被这台手机的 HAL 拆掉输出流再重建（1.4 秒 + 爆音），
-                        // 垫静音只是把这一小段变成「稍等一下」。write 在缓冲满时会阻塞，
-                        // 天然按实时速度垫。
-                        track.write(silence, 0, WRITE_CHUNK)
-                        writtenFrames += WRITE_CHUNK
-                        paddedFrames += WRITE_CHUNK
+                        // 余量见底：暂停轨道等数据，而不是写静音。
+                        // 写静音会让播放位置继续前进，KTV 会在没声音时继续跑，
+                        // 也会让“缓冲中”变成假进度。暂停后数据一到就接着播。
+                        if (!pausedForData) {
+                            pausedForData = true
+                            runCatching { track.pause() }
+                        }
+                        if (!buffering) {
+                            buffering = true
+                            onBuffering(true)
+                        }
+                        try {
+                            Thread.sleep(10)
+                        } catch (e: InterruptedException) {
+                            break
+                        }
+                        continue
                     }
                     if (cancelled) break
                     val chunk = c ?: continue
+                    if (pausedForData) {
+                        pausedForData = false
+                        runCatching { track.play() }
+                    }
+                    if (buffering) {
+                        buffering = false
+                        onBuffering(false)
+                    }
                     if (chunk === pill) {
                         sawPill = true
                         break
@@ -419,8 +440,9 @@ class AudioPlayer(private val context: Context) {
         onProgress: (segment: Int, fraction: Float) -> Unit,
         onDone: () -> Unit,
         speed: Float = 1f,
+        onBuffering: (Boolean) -> Unit = {},
     ): Speaker {
-        val sp = Speaker(sampleRate, speed, onLevel, onStarted, onProgress, onDone)
+        val sp = Speaker(sampleRate, speed, onLevel, onStarted, onProgress, onDone, onBuffering)
         sp.start()
         return sp
     }
